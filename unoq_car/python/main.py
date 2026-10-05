@@ -12,8 +12,10 @@ The motor speeds are sent to the sketch (sketch/sketch.ino) over the Bridge.
 """
 
 import json
+import statistics
 import threading
 import time
+from collections import deque
 
 import paho.mqtt.client as mqtt
 from arduino.app_utils import App, Bridge
@@ -34,22 +36,32 @@ FORWARD_INCREASES = True
 TARGET = 0.5             # centre of the frame (normalised 0..1)
 
 # How far off centre the minifig is decides how the car moves (fractions of the frame):
-#   error <= STOP_BAND                 -> stop, the minifig is centred
-#   centred and error <= RESTART_BAND  -> stay stopped (hysteresis: detection jitter of
-#                                         ~0.01 must not make the car twitch)
-#   error <= PULSE_ZONE                -> creep in short pulses: drive PULSE_ON seconds, stop,
-#                                         wait for a camera frame taken after the car stopped
 #   error > PULSE_ZONE                 -> drive continuously, faster the further away
+#   error <= PULSE_ZONE                -> creep in short pulses: drive PULSE_ON seconds, stop,
+#                                         wait PULSE_SETTLE, then judge the position from
+#                                         SETTLED_FRAMES frames taken after the car stopped
+#   settled error <= STOP_BAND         -> stop, the minifig is centred
+#   centred and error <= RESTART_BAND  -> stay stopped (hysteresis, so detection jitter
+#                                         doesn't make the car twitch)
+# Positions are the median of recent frames, so a single jumpy YOLO box can't stop the car.
 STOP_BAND = 0.02
-RESTART_BAND = 0.05
+RESTART_BAND = 0.03
 PULSE_ZONE = 0.15
+SMOOTH_WINDOW = 0.2      # seconds of frames to take the median of
+SETTLED_FRAMES = 3       # frames after a pulse has settled needed to judge the position
 FULL_SPEED_ERROR = 0.30  # at this error or more, drive at MAX_PWM
 
 MIN_PWM = 80             # slowest PWM (0-255) that still moves the car; raise it if it stalls
 MAX_PWM = 170            # fastest PWM; lower it if the car overshoots into the pulse zone
 MAX_STEP = 50            # max PWM change per control tick, so the car doesn't jerk
 
-PULSE_PWM = 110          # PWM during a pulse; raise it if pulses don't move the car at all
+PULSE_PWM = 110          # PWM of the first pulse; raise it if pulses don't move the car at all
+# A motor needs more power to start than to keep turning, so the PWM adapts to the car:
+PULSE_BOOST = 15         # a pulse moved the minifig < MIN_PULSE_MOVE -> next pulse +PULSE_BOOST PWM
+MIN_PULSE_MOVE = 0.005   # a pulse moved it > MAX_PULSE_MOVE -> next pulse -PULSE_BOOST PWM
+MAX_PULSE_MOVE = 0.03    # (between PULSE_PWM and MAX_PWM; otherwise the PWM that worked is kept)
+STALL_TIME = 0.5         # driving continuously but the minifig hasn't moved MIN_PULSE_MOVE in
+                         # this many seconds -> add PULSE_BOOST to the driving PWM
 PULSE_ON = 0.08          # seconds of driving per pulse; lower it for smaller steps
 PULSE_SETTLE = 0.30      # seconds to wait after a pulse so the camera/YOLO/MQTT catch up
 
@@ -58,6 +70,7 @@ LOOP_PERIOD = 0.05       # control tick; the sketch stops itself after ~400 ms o
 
 _lock = threading.Lock()
 _latest = {"position": None, "received": 0.0}
+_history = deque()         # (received, position) of recent frames with a minifig
 _current = 0               # last commanded PWM, for ramping
 _last_status = None
 _centred = False           # stopped inside STOP_BAND; stay stopped until RESTART_BAND is left
@@ -65,6 +78,10 @@ _pulsing = False           # in the pulse zone (vs. driving continuously)
 _pulse_speed = 0           # signed PWM of the current pulse
 _pulse_until = 0.0         # monotonic time the current pulse ends
 _settle_until = 0.0        # no new pulse before this time
+_pulse_pwm = PULSE_PWM     # PWM of the next pulse (boosted while pulses don't move the car)
+_last_judged = None        # settled position before the last pulse
+_drive_boost = 0           # extra PWM for continuous driving while the car is stalled
+_stall_check = None        # (time, position) continuous driving is compared against
 
 
 def direction(error: float) -> int:
@@ -77,29 +94,39 @@ def direction(error: float) -> int:
 def drive_speed(error: float) -> int:
     """Signed PWM for continuous driving: MIN_PWM at PULSE_ZONE, up to MAX_PWM at FULL_SPEED_ERROR."""
     fraction = min(1.0, max(0.0, (abs(error) - PULSE_ZONE) / (FULL_SPEED_ERROR - PULSE_ZONE)))
-    return direction(error) * round(MIN_PWM + fraction * (MAX_PWM - MIN_PWM))
+    pwm = MIN_PWM + fraction * (MAX_PWM - MIN_PWM) + _drive_boost
+    return direction(error) * round(min(MAX_PWM, pwm))
 
 
-def plan(position, received: float, now: float):
-    """Decide this tick's motor speed. Returns (speed, ramped, status)."""
-    global _centred, _pulsing, _pulse_speed, _pulse_until, _settle_until
+def plan(position, received: float, history, now: float):
+    """Decide this tick's motor speed. Returns (speed, ramped, status, judged position)."""
+    global _centred, _pulsing, _pulse_speed, _pulse_until, _settle_until, _pulse_pwm, _last_judged
+    global _drive_boost, _stall_check
 
     if position is None or now - received > LOST_TIMEOUT:
         _centred = _pulsing = False
-        return 0, False, "no minifig seen - stopped"
+        _drive_boost, _stall_check = 0, None
+        return 0, False, "no minifig seen - stopped", None
 
-    error = position - TARGET
-    magnitude = abs(error)
+    recent = [p for r, p in history if r >= now - SMOOTH_WINDOW] or [position]
+    smoothed = statistics.median(recent)
+    error = smoothed - TARGET
 
-    if magnitude <= STOP_BAND or (_centred and magnitude <= RESTART_BAND):
-        _centred, _pulsing = True, False
-        return 0, False, "minifig centred - stopped"
-    _centred = False
+    if _centred:
+        if abs(error) <= RESTART_BAND:
+            return 0, False, "minifig centred - stopped", smoothed
+        _centred = False  # drifted out of the centre: pulse back in
 
-    if magnitude > PULSE_ZONE:
+    if abs(error) > PULSE_ZONE:
         _pulsing = False
+        if _stall_check is None or abs(smoothed - _stall_check[1]) >= MIN_PULSE_MOVE:
+            _stall_check = (now, smoothed)  # moving (or just started): reset the stall timer
+        elif now - _stall_check[0] >= STALL_TIME:
+            _drive_boost = min(MAX_PWM - MIN_PWM, _drive_boost + PULSE_BOOST)
+            _stall_check = (now, smoothed)
+            print(f"  stalled at {AXIS}={smoothed:.3f} -> driving boost +{_drive_boost} PWM")
         speed = drive_speed(error)
-        return speed, True, "driving forward" if speed > 0 else "driving backward"
+        return speed, True, "driving forward" if speed > 0 else "driving backward", smoothed
 
     if not _pulsing:
         # Just arrived from continuous driving (or from centred): stop and let the car and
@@ -107,17 +134,39 @@ def plan(position, received: float, now: float):
         _pulsing = True
         _pulse_until = now
         _settle_until = now + PULSE_SETTLE
-        return 0, False, "pulsing - settling"
+        _last_judged = None
+        _drive_boost, _stall_check = 0, None
+        return 0, False, "pulsing - settling", smoothed
     if now < _pulse_until:
-        return _pulse_speed, False, "pulsing - moving"
-    if now < _settle_until or received < _settle_until:
-        # Wait until the settle time is over AND a position has arrived after it.
-        return 0, False, "pulsing - settling"
+        return _pulse_speed, False, "pulsing - moving", smoothed
 
-    _pulse_speed = direction(error) * PULSE_PWM
+    # Only judge the position from frames that arrived after the car had stopped and the
+    # camera/YOLO/MQTT pipeline had caught up.
+    settled = [p for r, p in history if r >= _settle_until]
+    if now < _settle_until or len(settled) < SETTLED_FRAMES:
+        return 0, False, "pulsing - settling", smoothed
+    settled_pos = statistics.median(settled[-SETTLED_FRAMES:])
+    error = settled_pos - TARGET
+
+    if abs(error) <= STOP_BAND:
+        _centred, _pulsing = True, False
+        print(f"  settled at {AXIS}={settled_pos:.3f} (off by {error:+.3f}) -> centred")
+        return 0, False, "minifig centred - stopped", settled_pos
+
+    if _last_judged is not None:
+        moved = abs(settled_pos - _last_judged)
+        if moved < MIN_PULSE_MOVE:
+            _pulse_pwm = min(MAX_PWM, _pulse_pwm + PULSE_BOOST)  # car didn't move: push harder
+        elif moved > MAX_PULSE_MOVE:
+            _pulse_pwm = max(PULSE_PWM, _pulse_pwm - PULSE_BOOST)  # step too big: ease off
+    _last_judged = settled_pos
+
+    _pulse_speed = direction(error) * _pulse_pwm
     _pulse_until = now + PULSE_ON
     _settle_until = _pulse_until + PULSE_SETTLE
-    return _pulse_speed, False, "pulsing - moving"
+    print(f"  settled at {AXIS}={settled_pos:.3f} (off by {error:+.3f}) -> "
+          f"pulse {'forward' if _pulse_speed > 0 else 'backward'} at PWM {_pulse_pwm}")
+    return _pulse_speed, False, "pulsing - moving", settled_pos
 
 
 def ramp(current: int, target: int) -> int:
@@ -146,8 +195,13 @@ def on_message(client, userdata, msg):
         print(f"Ignoring bad message: {e}")
         return
 
+    now = time.monotonic()
     with _lock:
-        _latest.update(position=position, received=time.monotonic())
+        _latest.update(position=position, received=now)
+        if position is not None:
+            _history.append((now, position))
+        while _history and _history[0][0] < now - 1.0:
+            _history.popleft()
 
 
 def start_mqtt() -> mqtt.Client:
@@ -178,10 +232,9 @@ def loop():
 
     with _lock:
         position, received = _latest["position"], _latest["received"]
+        history = list(_history)
 
-    target, ramped, status = plan(position, received, time.monotonic())
-    if status.startswith("no minifig"):
-        position = None
+    target, ramped, status, position = plan(position, received, history, time.monotonic())
     # Pulses must start at full PULSE_PWM straight away, so only continuous driving is ramped.
     speed = ramp(_current, target) if ramped else target
 
