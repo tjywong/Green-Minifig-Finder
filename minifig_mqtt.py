@@ -128,7 +128,7 @@ def draw_center_line(frame, message, deadband):
     """Vertical line at the middle of the frame plus the stop zone (+/- deadband).
 
     Turns green when the most confident minifig's centroid is inside the zone, i.e. when
-    the car (DEADBAND in unoq_car/python/main.py) considers it centred and stops.
+    the car (STOP_BAND in unoq_car/python/main.py) considers it centred and stops.
     """
     height, width = frame.shape[:2]
     mid = width // 2
@@ -275,11 +275,11 @@ def main():
     p.add_argument("--width", type=int, default=None, help="requested webcam width, e.g. 1280")
     p.add_argument("--height", type=int, default=None, help="requested webcam height, e.g. 720")
     p.add_argument("--no-show", dest="show", action="store_false", help="don't open a preview window")
-    p.add_argument("--deadband", type=float, default=0.05,
-                   help="half width of the centred zone drawn in the preview (match DEADBAND on the UNO Q)")
+    p.add_argument("--deadband", type=float, default=0.02,
+                   help="half width of the centred zone drawn in the preview (match STOP_BAND on the UNO Q)")
     p.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     p.add_argument("--conf", type=float, default=0.5, help="minimum detection confidence")
-    p.add_argument("--interval", type=float, default=0.2, help="minimum seconds between messages (0 = every frame)")
+    p.add_argument("--interval", type=float, default=0.0, help="minimum seconds between messages (0 = every frame)")
     p.add_argument("--broker", default="localhost")
     p.add_argument("--port", type=int, default=1883)
     p.add_argument("--topic", default="minifig/detections")

@@ -32,12 +32,26 @@ AXIS = "x"
 FORWARD_INCREASES = True
 
 TARGET = 0.5             # centre of the frame (normalised 0..1)
-DEADBAND = 0.05          # an axis counts as centred within this fraction of the frame
-FULL_SPEED_ERROR = 0.30  # at this error or more, the axis commands MAX_PWM
+
+# How far off centre the minifig is decides how the car moves (fractions of the frame):
+#   error <= STOP_BAND                 -> stop, the minifig is centred
+#   centred and error <= RESTART_BAND  -> stay stopped (hysteresis: detection jitter of
+#                                         ~0.01 must not make the car twitch)
+#   error <= PULSE_ZONE                -> creep in short pulses: drive PULSE_ON seconds, stop,
+#                                         wait for a camera frame taken after the car stopped
+#   error > PULSE_ZONE                 -> drive continuously, faster the further away
+STOP_BAND = 0.02
+RESTART_BAND = 0.05
+PULSE_ZONE = 0.15
+FULL_SPEED_ERROR = 0.30  # at this error or more, drive at MAX_PWM
 
 MIN_PWM = 80             # slowest PWM (0-255) that still moves the car; raise it if it stalls
-MAX_PWM = 170            # fastest PWM; lower it if the car overshoots
+MAX_PWM = 170            # fastest PWM; lower it if the car overshoots into the pulse zone
 MAX_STEP = 50            # max PWM change per control tick, so the car doesn't jerk
+
+PULSE_PWM = 110          # PWM during a pulse; raise it if pulses don't move the car at all
+PULSE_ON = 0.08          # seconds of driving per pulse; lower it for smaller steps
+PULSE_SETTLE = 0.30      # seconds to wait after a pulse so the camera/YOLO/MQTT catch up
 
 LOST_TIMEOUT = 0.5       # stop if no minifig has been seen for this many seconds
 LOOP_PERIOD = 0.05       # control tick; the sketch stops itself after ~400 ms of silence
@@ -46,26 +60,64 @@ _lock = threading.Lock()
 _latest = {"position": None, "received": 0.0}
 _current = 0               # last commanded PWM, for ramping
 _last_status = None
+_centred = False           # stopped inside STOP_BAND; stay stopped until RESTART_BAND is left
+_pulsing = False           # in the pulse zone (vs. driving continuously)
+_pulse_speed = 0           # signed PWM of the current pulse
+_pulse_until = 0.0         # monotonic time the current pulse ends
+_settle_until = 0.0        # no new pulse before this time
 
 
-def axis_command(error: float) -> float:
-    """Signed PWM (-MAX_PWM..MAX_PWM) with the sign of `error`; 0 inside the deadband."""
-    magnitude = abs(error)
-    if magnitude <= DEADBAND:
-        return 0.0
-    # Ramp from MIN_PWM just outside the deadband to MAX_PWM at FULL_SPEED_ERROR, so the
-    # car slows down as it approaches the centre.
-    fraction = min(1.0, (magnitude - DEADBAND) / (FULL_SPEED_ERROR - DEADBAND))
-    pwm = MIN_PWM + fraction * (MAX_PWM - MIN_PWM)
-    return pwm if error > 0 else -pwm
-
-
-def compute_speed(position: float) -> int:
-    """Signed PWM (-MAX_PWM..MAX_PWM) for both motors that moves the minifig towards TARGET."""
-    error = position - TARGET
+def direction(error: float) -> int:
+    """+1 (forward) or -1 (backward): the way to drive to move the minifig towards TARGET."""
     # The minifig is past the centre in the + direction, so move it in the - direction.
-    speed = -axis_command(error)
-    return round(speed if FORWARD_INCREASES else -speed)
+    away = 1 if error > 0 else -1
+    return -away if FORWARD_INCREASES else away
+
+
+def drive_speed(error: float) -> int:
+    """Signed PWM for continuous driving: MIN_PWM at PULSE_ZONE, up to MAX_PWM at FULL_SPEED_ERROR."""
+    fraction = min(1.0, max(0.0, (abs(error) - PULSE_ZONE) / (FULL_SPEED_ERROR - PULSE_ZONE)))
+    return direction(error) * round(MIN_PWM + fraction * (MAX_PWM - MIN_PWM))
+
+
+def plan(position, received: float, now: float):
+    """Decide this tick's motor speed. Returns (speed, ramped, status)."""
+    global _centred, _pulsing, _pulse_speed, _pulse_until, _settle_until
+
+    if position is None or now - received > LOST_TIMEOUT:
+        _centred = _pulsing = False
+        return 0, False, "no minifig seen - stopped"
+
+    error = position - TARGET
+    magnitude = abs(error)
+
+    if magnitude <= STOP_BAND or (_centred and magnitude <= RESTART_BAND):
+        _centred, _pulsing = True, False
+        return 0, False, "minifig centred - stopped"
+    _centred = False
+
+    if magnitude > PULSE_ZONE:
+        _pulsing = False
+        speed = drive_speed(error)
+        return speed, True, "driving forward" if speed > 0 else "driving backward"
+
+    if not _pulsing:
+        # Just arrived from continuous driving (or from centred): stop and let the car and
+        # the camera settle before judging where the minifig really is.
+        _pulsing = True
+        _pulse_until = now
+        _settle_until = now + PULSE_SETTLE
+        return 0, False, "pulsing - settling"
+    if now < _pulse_until:
+        return _pulse_speed, False, "pulsing - moving"
+    if now < _settle_until or received < _settle_until:
+        # Wait until the settle time is over AND a position has arrived after it.
+        return 0, False, "pulsing - settling"
+
+    _pulse_speed = direction(error) * PULSE_PWM
+    _pulse_until = now + PULSE_ON
+    _settle_until = _pulse_until + PULSE_SETTLE
+    return _pulse_speed, False, "pulsing - moving"
 
 
 def ramp(current: int, target: int) -> int:
@@ -127,16 +179,11 @@ def loop():
     with _lock:
         position, received = _latest["position"], _latest["received"]
 
-    if position is None or time.monotonic() - received > LOST_TIMEOUT:
-        target, status, position = 0, "no minifig seen - stopped", None
-    else:
-        target = compute_speed(position)
-        if target == 0:
-            status = "minifig centred - stopped"
-        else:
-            status = "driving forward" if target > 0 else "driving backward"
-
-    speed = ramp(_current, target)
+    target, ramped, status = plan(position, received, time.monotonic())
+    if status.startswith("no minifig"):
+        position = None
+    # Pulses must start at full PULSE_PWM straight away, so only continuous driving is ramped.
+    speed = ramp(_current, target) if ramped else target
 
     # Sent every tick, even when stopped, so the sketch's watchdog knows we're alive.
     # Both motors get the same speed so the car drives straight.

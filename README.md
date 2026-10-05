@@ -31,7 +31,7 @@ The server listens on port 1883 and accepts any device that can reach this Mac, 
 **2. Start the detector** (leave it running):
 
 ```bash
-.venv/bin/python minifig_mqtt.py --interval 0.1
+.venv/bin/python minifig_mqtt.py
 ```
 
 A preview window shows the webcam with a box around each minifig. Quit at any time with `q` or `Esc` (in the window or the terminal), by closing the window, or with Ctrl-C.
@@ -62,7 +62,7 @@ arduino-app-cli app stop ~/ArduinoApps/unoq_car     # stop the car
 .venv/bin/python minifig_mqtt.py --source photo.jpg              # image, folder, video or stream URL instead of the webcam
 ```
 
-Messages are sent at most every `--interval` seconds (default 0.2). Run `.venv/bin/python minifig_mqtt.py --help` for all options.
+By default every frame is sent; use `--interval 0.1` to send at most one message every 0.1 s. Run `.venv/bin/python minifig_mqtt.py --help` for all options.
 
 Each message is published to `minifig/detections` (by default) as:
 

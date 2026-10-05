@@ -17,7 +17,9 @@ Power the motors from the MakerDrive's own battery input and share GND with the 
 ## How it works
 
 - `python/main.py` (Linux side) subscribes to MQTT, takes the highest-confidence detection's `center_norm` along `AXIS`, and every 50 ms sends the **same** PWM to both motors, so the car only drives forward or backward (no steering):
-  - proportional speed between `MIN_PWM` and `MAX_PWM`, a deadband around the centre, ramped acceleration
+  - far from the centre (more than `PULSE_ZONE`): drives continuously, ramping from `MIN_PWM` up to `MAX_PWM`
+  - close to the centre: creeps in short pulses (`PULSE_PWM` for `PULSE_ON` seconds, then waits `PULSE_SETTLE` for a fresh camera frame), so camera/network delay doesn't make it overshoot
+  - within `STOP_BAND` of the centre: stops, and stays stopped until the minifig is more than `RESTART_BAND` off (so detection jitter doesn't make it twitch)
   - no detection for 0.5 s → stop
 - `sketch/sketch.ino` (MCU side) exposes `set_motors(left, right)` over the Bridge, drives the MakerDrive, and stops the motors if commands stop arriving for 400 ms.
 
@@ -27,7 +29,9 @@ Edit the constants at the top of `python/main.py`:
 
 - `MQTT_BROKER`: IP of the computer running Mosquitto.
 - `AXIS` (`"x"` or `"y"`): which image axis the car moves along. If the car drives away from the centre, flip `FORWARD_INCREASES`.
-- `MIN_PWM` (raise if the car stalls), `MAX_PWM` (lower if it overshoots), `DEADBAND`.
+- `MIN_PWM` (raise if the car stalls), `MAX_PWM` (lower if it overshoots into the pulse zone).
+- `PULSE_PWM` (raise if pulses don't move the car), `PULSE_ON` (lower for smaller steps), `PULSE_SETTLE` (raise if it still overshoots near the centre).
+- `STOP_BAND` / `RESTART_BAND`: how close counts as centred. Keep `minifig_mqtt.py --deadband` equal to `STOP_BAND` so the preview's green zone matches.
 - In `sketch/sketch.ino`, flip `MOTOR1_REVERSED` / `MOTOR2_REVERSED` if a wheel spins backward on a forward command.
 
 ## Run
