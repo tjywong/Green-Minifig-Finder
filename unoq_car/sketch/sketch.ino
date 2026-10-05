@@ -11,7 +11,11 @@
 //
 // Wiring: D5 -> M1A, D6 -> M1B (left motor), D9 -> M2A, D10 -> M2B (right motor),
 // and UNO Q GND -> MakerDrive GND.
+//
+// The LED matrix shows where the minifig is in the camera image: python/main.py calls
+// set_dot(col, row) with the position scaled to the 13x8 matrix (-1, -1 = no minifig).
 
+#include <Arduino_LED_Matrix.h>
 #include <Arduino_RouterBridge.h>
 
 const int MOTOR1_A = 5;   // left motor
@@ -28,6 +32,14 @@ const unsigned long WATCHDOG_MS = 400;
 
 unsigned long lastCommandMs = 0;
 bool motorsRunning = false;
+
+const int MATRIX_COLS = 13;
+const int MATRIX_ROWS = 8;
+const uint8_t DOT_BRIGHTNESS = 7;     // 0-7 (3-bit grayscale)
+const uint8_t CENTRE_BRIGHTNESS = 1;  // dim column marking the middle of the image; 0 = off
+
+Arduino_LED_Matrix matrix;
+uint8_t frame[MATRIX_COLS * MATRIX_ROWS];
 
 // speed: -255 (full backward) .. 0 (stop) .. 255 (full forward)
 void driveMotor(int pinA, int pinB, bool reversed, int speed) {
@@ -62,6 +74,18 @@ void set_motors(int left, int right) {
   lastCommandMs = millis();
 }
 
+// Called from Python: Bridge.call("set_dot", col, row). col/row = -1 clears the dot.
+void set_dot(int col, int row) {
+  memset(frame, 0, sizeof(frame));
+  for (int r = 0; r < MATRIX_ROWS; r++) {
+    frame[r * MATRIX_COLS + MATRIX_COLS / 2] = CENTRE_BRIGHTNESS;
+  }
+  if (col >= 0 && col < MATRIX_COLS && row >= 0 && row < MATRIX_ROWS) {
+    frame[row * MATRIX_COLS + col] = DOT_BRIGHTNESS;
+  }
+  matrix.draw(frame);
+}
+
 void setup() {
   pinMode(MOTOR1_A, OUTPUT);
   pinMode(MOTOR1_B, OUTPUT);
@@ -69,10 +93,15 @@ void setup() {
   pinMode(MOTOR2_B, OUTPUT);
   stopMotors();
 
+  matrix.begin();
+  matrix.setGrayscaleBits(3);
+  set_dot(-1, -1);
+
   Bridge.begin();
   Monitor.begin();
   // provide_safe runs set_motors in the main loop thread, so it never races loop()
   Bridge.provide_safe("set_motors", set_motors);
+  Bridge.provide_safe("set_dot", set_dot);
 }
 
 void loop() {

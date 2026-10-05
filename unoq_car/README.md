@@ -24,6 +24,7 @@ Power the motors from the MakerDrive's own battery input and share GND with the 
   - the power adapts to the car: a pulse that doesn't move the minifig makes the next one `PULSE_BOOST` stronger, and continuous driving gets boosted if the minifig hasn't moved for `STALL_TIME`. Each pulse decision is printed in the log (`settled at x=... -> pulse forward at PWM ...`)
   - no detection for 0.5 s → stop
 - `sketch/sketch.ino` (MCU side) exposes `set_motors(left, right)` over the Bridge, drives the MakerDrive, and stops the motors if commands stop arriving for 400 ms.
+- LED matrix: the minifig's position in the camera image is shown as a bright blue dot, scaled to the 13×8 matrix (`col = x × 12`, `row = y × 7`, from `center_norm`). A dim column marks the middle of the image, so the dot sits on it when the minifig is centred (set `CENTRE_BRIGHTNESS = 0` in the sketch to hide it). The dot disappears when no minifig is seen.
 
 ## Tuning
 

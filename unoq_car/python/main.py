@@ -66,10 +66,14 @@ PULSE_ON = 0.08          # seconds of driving per pulse; lower it for smaller st
 PULSE_SETTLE = 0.30      # seconds to wait after a pulse so the camera/YOLO/MQTT catch up
 
 LOST_TIMEOUT = 0.5       # stop if no minifig has been seen for this many seconds
+
+MATRIX_COLS = 13         # the UNO Q LED matrix shows the minifig's position in the image
+MATRIX_ROWS = 8          # as a dot, scaled from center_norm to these columns/rows
+DOT_REFRESH = 1.0        # resend the dot at least this often (e.g. after the sketch restarts)
 LOOP_PERIOD = 0.05       # control tick; the sketch stops itself after ~400 ms of silence
 
 _lock = threading.Lock()
-_latest = {"position": None, "received": 0.0}
+_latest = {"position": None, "received": 0.0, "dot": None}
 _history = deque()         # (received, position) of recent frames with a minifig
 _current = 0               # last commanded PWM, for ramping
 _last_status = None
@@ -82,6 +86,8 @@ _pulse_pwm = PULSE_PWM     # PWM of the next pulse (boosted while pulses don't m
 _last_judged = None        # settled position before the last pulse
 _drive_boost = 0           # extra PWM for continuous driving while the car is stalled
 _stall_check = None        # (time, position) continuous driving is compared against
+_shown_dot = None          # (col, row) last sent to the LED matrix
+_dot_sent = 0.0            # monotonic time it was sent
 
 
 def direction(error: float) -> int:
@@ -187,17 +193,18 @@ def on_connect(client, userdata, flags, reason_code, properties=None):
 def on_message(client, userdata, msg):
     try:
         detections = json.loads(msg.payload).get("detections") or []
-        position = None
+        position = dot = None
         if detections:
             best = max(detections, key=lambda d: d["confidence"])
             position = float(best["center_norm"][AXIS])
+            dot = (float(best["center_norm"]["x"]), float(best["center_norm"]["y"]))
     except (ValueError, KeyError, TypeError, AttributeError) as e:
         print(f"Ignoring bad message: {e}")
         return
 
     now = time.monotonic()
     with _lock:
-        _latest.update(position=position, received=now)
+        _latest.update(position=position, received=now, dot=dot)
         if position is not None:
             _history.append((now, position))
         while _history and _history[0][0] < now - 1.0:
@@ -219,6 +226,24 @@ def start_mqtt() -> mqtt.Client:
     return client
 
 
+def to_matrix(dot):
+    """Scale a (0..1, 0..1) image position to a (col, row) on the LED matrix; None -> (-1, -1)."""
+    if dot is None:
+        return -1, -1
+    col = min(MATRIX_COLS - 1, max(0, round(dot[0] * (MATRIX_COLS - 1))))
+    row = min(MATRIX_ROWS - 1, max(0, round(dot[1] * (MATRIX_ROWS - 1))))
+    return col, row
+
+
+def show_dot(dot, now: float):
+    """Send the dot to the sketch when it moves (and every DOT_REFRESH seconds)."""
+    global _shown_dot, _dot_sent
+    cell = to_matrix(dot)
+    if cell != _shown_dot or now - _dot_sent >= DOT_REFRESH:
+        Bridge.call("set_dot", *cell)
+        _shown_dot, _dot_sent = cell, now
+
+
 def report(status: str, position=None):
     global _last_status
     if status != _last_status:
@@ -231,10 +256,13 @@ def loop():
     global _current
 
     with _lock:
-        position, received = _latest["position"], _latest["received"]
+        position, received, dot = _latest["position"], _latest["received"], _latest["dot"]
         history = list(_history)
 
-    target, ramped, status, position = plan(position, received, history, time.monotonic())
+    now = time.monotonic()
+    target, ramped, status, position = plan(position, received, history, now)
+    if position is None:
+        dot = None  # minifig lost: clear the dot too
     # Pulses must start at full PULSE_PWM straight away, so only continuous driving is ramped.
     speed = ramp(_current, target) if ramped else target
 
@@ -242,6 +270,7 @@ def loop():
     # Both motors get the same speed so the car drives straight.
     try:
         Bridge.call("set_motors", speed, speed)
+        show_dot(dot, now)
     except (ValueError, TimeoutError) as e:
         # The sketch may not have registered set_motors yet right after startup.
         _current = 0
