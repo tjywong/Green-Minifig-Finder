@@ -124,7 +124,32 @@ def open_camera(index, width, height):
     )
 
 
-def draw_detections(frame, message):
+def draw_center_line(frame, message, deadband):
+    """Vertical line at the middle of the frame plus the stop zone (+/- deadband).
+
+    Turns green when the most confident minifig's centroid is inside the zone, i.e. when
+    the car (DEADBAND in unoq_car/python/main.py) considers it centred and stops.
+    """
+    height, width = frame.shape[:2]
+    mid = width // 2
+    band = int(deadband * width)
+
+    best = max(message["detections"], key=lambda d: d["confidence"], default=None)
+    error = None if best is None else best["center_norm"]["x"] - 0.5
+    centred = error is not None and abs(error) <= deadband
+    color = (0, 255, 0) if centred else (0, 255, 255)  # BGR: green when centred, else yellow
+
+    cv2.line(frame, (mid - band, 0), (mid - band, height), color, 1)
+    cv2.line(frame, (mid + band, 0), (mid + band, height), color, 1)
+    cv2.line(frame, (mid, 0), (mid, height), color, 2)
+
+    if error is not None:
+        label = "CENTRED" if centred else f"off centre: {error:+.2f}"
+        cv2.putText(frame, label, (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+
+
+def draw_detections(frame, message, deadband):
+    draw_center_line(frame, message, deadband)
     for det in message["detections"]:
         b, c = det["bbox"], det["center"]
         cv2.rectangle(frame, (int(b["x1"]), int(b["y1"])), (int(b["x2"]), int(b["y2"])), (0, 255, 0), 2)
@@ -223,7 +248,7 @@ def run_webcam(model, publisher, args, stop):
             publisher.send(message)
 
             if args.show:
-                cv2.imshow(WINDOW_NAME, draw_detections(frame, message))
+                cv2.imshow(WINDOW_NAME, draw_detections(frame, message, args.deadband))
                 if (cv2.waitKey(1) & 0xFF) in QUIT_KEYS or window_closed():
                     break
             frame_idx += 1
@@ -250,6 +275,8 @@ def main():
     p.add_argument("--width", type=int, default=None, help="requested webcam width, e.g. 1280")
     p.add_argument("--height", type=int, default=None, help="requested webcam height, e.g. 720")
     p.add_argument("--no-show", dest="show", action="store_false", help="don't open a preview window")
+    p.add_argument("--deadband", type=float, default=0.05,
+                   help="half width of the centred zone drawn in the preview (match DEADBAND on the UNO Q)")
     p.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     p.add_argument("--conf", type=float, default=0.5, help="minimum detection confidence")
     p.add_argument("--interval", type=float, default=0.2, help="minimum seconds between messages (0 = every frame)")
