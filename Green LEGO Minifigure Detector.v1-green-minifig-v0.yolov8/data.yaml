@@ -1,0 +1,13 @@
+train: ../train/images
+val: ../valid/images
+test: ../test/images
+
+nc: 1
+names: ['green-lego-minifigure-detector']
+
+roboflow:
+  workspace: tyler_joseph-wong-tufts-edu
+  project: green-lego-minifigure-detector
+  version: 1
+  license: Private
+  url: https://app.roboflow.com/tyler_joseph-wong-tufts-edu/green-lego-minifigure-detector/1
