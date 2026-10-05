@@ -1,34 +1,35 @@
 // Green Minifig Finder car - MCU side of the Arduino UNO Q App Lab app.
 //
 // Drives two DC motors through a Cytron MakerDrive. The Linux side (python/main.py)
-// decides the speed and calls set_motors(left, right) over the Bridge about 20x/second.
+// calls set_motors(left, right) over the Bridge about 20x/second; this sketch only
+// turns those signed speeds into PWM and stops the car if the commands stop arriving.
 //
-// MakerDrive truth table (per motor):
+// MakerDrive truth table (per motor, inputs A and B):
 //   A = PWM, B = LOW  -> forward
 //   A = LOW, B = PWM  -> backward
-//   A = LOW, B = LOW  -> brake
+//   A = LOW, B = LOW  -> stop
 //
-// Wiring: UNO Q D5 -> M1A, D6 -> M1B, D9 -> M2A, D10 -> M2B, and UNO Q GND -> MakerDrive GND.
+// Wiring: D5 -> M1A, D6 -> M1B (left motor), D9 -> M2A, D10 -> M2B (right motor),
+// and UNO Q GND -> MakerDrive GND.
 
 #include <Arduino_RouterBridge.h>
 
-const int MOTOR1_A = 5;
+const int MOTOR1_A = 5;   // left motor
 const int MOTOR1_B = 6;
-const int MOTOR2_A = 9;
+const int MOTOR2_A = 9;   // right motor
 const int MOTOR2_B = 10;
 
-// The two motors face opposite ways on most cars, so one usually has to be reversed for
-// both wheels to roll forward. Flip these if a wheel spins the wrong way.
+// Flip these if a wheel spins the wrong way when the car is told to drive forward.
 const bool MOTOR1_REVERSED = false;
-const bool MOTOR2_REVERSED = false;
+const bool MOTOR2_REVERSED = true;
 
-// Stop the motors if no command arrives for this long (e.g. Wi-Fi drops or Python crashes).
-const unsigned long WATCHDOG_MS = 500;
+// Stop if no command arrives for this long (Wi-Fi drop, Python crash, ...).
+const unsigned long WATCHDOG_MS = 400;
 
 unsigned long lastCommandMs = 0;
 bool motorsRunning = false;
 
-// speed: -255 (full backward) .. 0 (brake) .. 255 (full forward)
+// speed: -255 (full backward) .. 0 (stop) .. 255 (full forward)
 void driveMotor(int pinA, int pinB, bool reversed, int speed) {
   speed = constrain(speed, -255, 255);
   if (reversed) {
@@ -54,10 +55,10 @@ void stopMotors() {
 }
 
 // Called from Python: Bridge.call("set_motors", left, right)
-void set_motors(int motor1Speed, int motor2Speed) {
-  driveMotor(MOTOR1_A, MOTOR1_B, MOTOR1_REVERSED, motor1Speed);
-  driveMotor(MOTOR2_A, MOTOR2_B, MOTOR2_REVERSED, motor2Speed);
-  motorsRunning = (motor1Speed != 0 || motor2Speed != 0);
+void set_motors(int left, int right) {
+  driveMotor(MOTOR1_A, MOTOR1_B, MOTOR1_REVERSED, left);
+  driveMotor(MOTOR2_A, MOTOR2_B, MOTOR2_REVERSED, right);
+  motorsRunning = (left != 0 || right != 0);
   lastCommandMs = millis();
 }
 
