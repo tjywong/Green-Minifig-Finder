@@ -1,0 +1,8 @@
+name: Minifig Car
+description: "Drives a two-motor car until a green LEGO minifig is centred in the camera frame, using positions received over MQTT"
+icon: 🚗
+version: "1.0.0"
+
+ports: []
+
+bricks: []

@@ -1,25 +1,30 @@
 """Detect green LEGO minifigs and publish their locations over MQTT as JSON.
 
 Usage:
-    python minifig_mqtt.py                                  # webcam 0 -> localhost:1883
-    python minifig_mqtt.py --source photo.jpg --broker 192.168.1.50
-    python minifig_mqtt.py --source images/ --dry-run       # print JSON, don't publish
+    python minifig_mqtt.py                                  # first working webcam -> localhost:1883
+    python minifig_mqtt.py --camera 1 --broker 192.168.1.50 # pick a specific webcam
+    python minifig_mqtt.py --dry-run                        # webcam, print JSON instead of publishing
+    python minifig_mqtt.py --source photo.jpg               # image, folder, video or stream URL
 
-Each processed frame publishes one message to --topic, e.g.:
+Webcam mode shows a live preview window with the detections (pass --no-show to run
+headless). Quit at any time by pressing q or Esc in the preview window or the terminal,
+closing the window, or pressing Ctrl-C.
+
+Each published frame sends one message to --topic, e.g.:
 {
   "timestamp": "2026-10-05T14:30:00.123456+00:00",
-  "source": "photo.jpg",
+  "source": "webcam:1",
   "frame": 0,
-  "image": {"width": 640, "height": 640},
+  "image": {"width": 1920, "height": 1080},
   "count": 1,
   "detections": [
     {
       "id": 0,
       "label": "green-lego-minifigure-detector",
       "confidence": 0.91,
-      "center": {"x": 312.4, "y": 280.1},
-      "center_norm": {"x": 0.488, "y": 0.438},
-      "bbox": {"x1": 270.0, "y1": 200.5, "x2": 354.8, "y2": 359.7},
+      "center": {"x": 912.4, "y": 480.1},
+      "center_norm": {"x": 0.4752, "y": 0.4445},
+      "bbox": {"x1": 870.0, "y1": 400.5, "x2": 954.8, "y2": 559.7},
       "size": {"width": 84.8, "height": 159.2}
     }
   ]
@@ -28,15 +33,25 @@ Each processed frame publishes one message to --topic, e.g.:
 
 import argparse
 import json
+import select
+import signal
+import sys
+import termios
+import threading
+import time
+import tty
 from datetime import datetime, timezone
 from pathlib import Path
 
+import cv2
 import paho.mqtt.client as mqtt
 import torch
 from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_WEIGHTS = ROOT / "runs" / "green_minifig" / "weights" / "best.pt"
+WINDOW_NAME = "Green Minifig Finder (q to quit)"
+QUIT_KEYS = {ord("q"), ord("Q"), 27}  # 27 = Esc
 
 
 def pick_device() -> str:
@@ -47,7 +62,7 @@ def pick_device() -> str:
     return "cpu"
 
 
-def result_to_message(result, frame_idx: int) -> dict:
+def result_to_message(result, frame_idx: int, source: str) -> dict:
     """Convert one Ultralytics result into a JSON-serialisable location message."""
     height, width = result.orig_shape
     detections = []
@@ -68,7 +83,7 @@ def result_to_message(result, frame_idx: int) -> dict:
 
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "source": Path(result.path).name if result.path else None,
+        "source": source,
         "frame": frame_idx,
         "image": {"width": width, "height": height},
         "count": len(detections),
@@ -85,11 +100,159 @@ def connect(args) -> mqtt.Client:
     return client
 
 
+def open_camera(index, width, height):
+    """Open the requested webcam, or the first one that actually returns frames.
+
+    Some indexes (e.g. iPhone Continuity Camera or virtual cameras) open but never
+    deliver an image, so each candidate is checked with a test read.
+    """
+    candidates = [index] if index is not None else range(5)
+    for i in candidates:
+        cap = cv2.VideoCapture(i)
+        if cap.isOpened():
+            if width:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            if height:
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            ok, _ = cap.read()
+            if ok:
+                return cap, i
+        cap.release()
+    raise RuntimeError(
+        f"No working webcam found (tried {list(candidates)}). On macOS, allow camera access for "
+        "your terminal/VS Code in System Settings > Privacy & Security > Camera."
+    )
+
+
+def draw_detections(frame, message):
+    for det in message["detections"]:
+        b, c = det["bbox"], det["center"]
+        cv2.rectangle(frame, (int(b["x1"]), int(b["y1"])), (int(b["x2"]), int(b["y2"])), (0, 255, 0), 2)
+        cv2.circle(frame, (int(c["x"]), int(c["y"])), 5, (0, 0, 255), -1)
+        text = f"{det['confidence']:.2f}  ({det['center_norm']['x']:.2f}, {det['center_norm']['y']:.2f})"
+        cv2.putText(frame, text, (int(b["x1"]), max(int(b["y1"]) - 8, 20)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(frame, f"minifigs: {message['count']}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    return frame
+
+
+class Publisher:
+    """Sends messages to MQTT (or prints them in --dry-run), at most once per --interval."""
+
+    def __init__(self, args):
+        self.args = args
+        self.client = None if args.dry_run else connect(args)
+        self.last_sent = 0.0
+
+    def send(self, message: dict):
+        if self.args.only_detections and message["count"] == 0:
+            return
+        now = time.monotonic()
+        if now - self.last_sent < self.args.interval:
+            return
+        self.last_sent = now
+
+        if self.client is None:
+            print(json.dumps(message))
+        else:
+            info = self.client.publish(self.args.topic, json.dumps(message), qos=self.args.qos)
+            info.wait_for_publish(timeout=2)
+            centers = [(d["center_norm"]["x"], d["center_norm"]["y"]) for d in message["detections"]]
+            print(f"[{self.args.topic}] frame {message['frame']}: {message['count']} minifig(s) {centers}")
+
+    def close(self):
+        if self.client is not None:
+            self.client.loop_stop()
+            self.client.disconnect()
+
+
+class TerminalQuitListener:
+    """Sets `stop` when q (or Esc) is pressed in the terminal, no Enter needed.
+
+    The preview window only sees keys while it has focus, so this lets you quit from
+    the terminal too (and in --no-show mode).
+    """
+
+    def __init__(self):
+        self.stop = threading.Event()
+        self._saved_tty = None
+
+    def __enter__(self):
+        if sys.stdin.isatty():
+            self._saved_tty = termios.tcgetattr(sys.stdin)
+            tty.setcbreak(sys.stdin)  # read single keypresses; Ctrl-C still works
+            threading.Thread(target=self._listen, daemon=True).start()
+        return self
+
+    def _listen(self):
+        while not self.stop.is_set():
+            ready, _, _ = select.select([sys.stdin], [], [], 0.1)
+            if ready and ord(sys.stdin.read(1)) in QUIT_KEYS:
+                self.stop.set()
+
+    def __exit__(self, *exc):
+        self.stop.set()
+        if self._saved_tty is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self._saved_tty)
+
+
+def window_closed() -> bool:
+    try:
+        return cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1
+    except cv2.error:
+        return True
+
+
+def run_webcam(model, publisher, args, stop):
+    cap, index = open_camera(args.camera, args.width, args.height)
+    source = f"webcam:{index}"
+    print(f"Using {source} ({int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}x{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))})")
+    print("Press q (in the preview window or this terminal) to quit.")
+    device = pick_device()
+    frame_idx = 0
+    try:
+        while not stop.is_set():
+            ok, frame = cap.read()
+            if not ok:
+                print("Webcam stopped returning frames.")
+                break
+
+            result = model.predict(frame, conf=args.conf, device=device, verbose=False)[0]
+            message = result_to_message(result, frame_idx, source)
+            publisher.send(message)
+
+            if args.show:
+                cv2.imshow(WINDOW_NAME, draw_detections(frame, message))
+                if (cv2.waitKey(1) & 0xFF) in QUIT_KEYS or window_closed():
+                    break
+            frame_idx += 1
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)  # macOS needs an event-loop tick to actually close the window
+        print("Stopped.")
+
+
+def run_source(model, publisher, args, stop):
+    # stream=True yields results one at a time instead of loading everything into memory
+    results = model.predict(args.source, conf=args.conf, stream=True, device=pick_device(), verbose=False)
+    for frame_idx, result in enumerate(results):
+        if stop.is_set():
+            break
+        publisher.send(result_to_message(result, frame_idx, Path(result.path).name))
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--source", default="0", help="image, folder, video, stream URL, or webcam index")
+    p.add_argument("--source", default=None, help="image, folder, video or stream URL (default: webcam)")
+    p.add_argument("--camera", type=int, default=None, help="webcam index (default: first working one)")
+    p.add_argument("--width", type=int, default=None, help="requested webcam width, e.g. 1280")
+    p.add_argument("--height", type=int, default=None, help="requested webcam height, e.g. 720")
+    p.add_argument("--no-show", dest="show", action="store_false", help="don't open a preview window")
     p.add_argument("--weights", default=str(DEFAULT_WEIGHTS))
     p.add_argument("--conf", type=float, default=0.5, help="minimum detection confidence")
+    p.add_argument("--interval", type=float, default=0.2, help="minimum seconds between messages (0 = every frame)")
     p.add_argument("--broker", default="localhost")
     p.add_argument("--port", type=int, default=1883)
     p.add_argument("--topic", default="minifig/detections")
@@ -101,30 +264,25 @@ def main():
     p.add_argument("--dry-run", action="store_true", help="print JSON instead of publishing")
     args = p.parse_args()
 
-    source = int(args.source) if args.source.isdigit() else args.source
+    # treat `kill` like Ctrl-C so the camera, window and MQTT connection are cleaned up
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+
     model = YOLO(args.weights)
-    client = None if args.dry_run else connect(args)
-
+    publisher = Publisher(args)
     try:
-        # stream=True yields results one frame at a time (needed for webcam/video)
-        results = model.predict(source, conf=args.conf, stream=True, device=pick_device(), verbose=False)
-        for frame_idx, result in enumerate(results):
-            message = result_to_message(result, frame_idx)
-            if args.only_detections and message["count"] == 0:
-                continue
-
-            payload = json.dumps(message)
-            if client is None:
-                print(json.dumps(message, indent=2))
+        with TerminalQuitListener() as listener:
+            if args.source is None:
+                run_webcam(model, publisher, args, listener.stop)
+            elif args.source.isdigit():  # allow the old "--source 0" webcam syntax
+                args.camera = int(args.source)
+                run_webcam(model, publisher, args, listener.stop)
             else:
-                client.publish(args.topic, payload, qos=args.qos).wait_for_publish()
-                print(f"[{args.topic}] frame {frame_idx}: {message['count']} minifig(s)")
+                args.interval = 0  # files: publish every image, no rate limit
+                run_source(model, publisher, args, listener.stop)
     except KeyboardInterrupt:
         pass
     finally:
-        if client is not None:
-            client.loop_stop()
-            client.disconnect()
+        publisher.close()
 
 
 if __name__ == "__main__":
